@@ -6,9 +6,10 @@ Results:
   use_gui: True
   eval_rendering: False
   use_wandb: True 
+  skip_ate: True
 
 Dataset:
-  type: 'tum'
+  type: 'monocular'
   sensor_type: 'monocular'
   pcd_downsample: 64
   pcd_downsample_init: 32

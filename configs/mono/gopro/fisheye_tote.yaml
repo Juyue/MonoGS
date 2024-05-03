@@ -1,0 +1,17 @@
+inherit_from: "configs/mono/gopro/base_config.yaml"
+
+Dataset:
+  dataset_path: "/home/ubuntu/datasets/umi_3dgs/rgb_20240424_pick_mapping_tmp"
+  Calibration:
+    fx: 796.85
+    fy: 796.85 
+    cx: 1352.0 
+    cy: 1014.0 
+    k1: -0.017458392874590136
+    k2: -0.028082549474531236
+    p1: 0.01283269195493874
+    p2: -0.004519804281212253
+    k3: 0.0
+    width: 2704 
+    height: 2028 
+    distorted: True 

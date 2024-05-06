@@ -44,7 +44,30 @@ class ReplicaParser:
             frames.append(frame)
         self.frames = frames
 
+class MonocularOnlyParser:
+    def __init__(self, input_folder):
+        self.input_folder = input_folder
+        self.load_images(self.input_folder)
+        self.n_img = len(self.color_paths)
 
+    def parse_list(self, filepath, skiprows=0):
+        data = np.loadtxt(filepath, delimiter=" ", dtype=np.unicode_, skiprows=skiprows)
+        return data
+
+    def load_images(self, datapath):
+        image_list = os.path.join(datapath, "rgb.txt")
+        image_data = self.parse_list(image_list)
+        tstamp_image = image_data[:, 0].astype(np.float64)
+        self.color_paths, self.frames = [], []
+        for i in range(len(tstamp_image)):
+            self.color_paths += [os.path.join(datapath, image_data[i, 1])]
+
+            frame = {
+                "file_path": str(os.path.join(datapath, image_data[i, 1])),
+            }
+
+            self.frames.append(frame)
+    
 class TUMParser:
     def __init__(self, input_folder):
         self.input_folder = input_folder
@@ -73,7 +96,7 @@ class TUMParser:
                     associations.append((i, j, k))
 
         return associations
-
+    
     def load_poses(self, datapath, frame_rate=-1):
         if os.path.isfile(os.path.join(datapath, "groundtruth.txt")):
             pose_list = os.path.join(datapath, "groundtruth.txt")
@@ -403,6 +426,35 @@ class TUMDataset(MonocularDataset):
         self.depth_paths = parser.depth_paths
         self.poses = parser.poses
 
+class MonocularOnlyDataset(MonocularDataset):
+    def __init__(self, args, path, config):
+        super().__init__(args, path, config)
+        dataset_path = config["Dataset"]["dataset_path"]
+        parser = MonocularOnlyParser(dataset_path)
+        self.num_imgs = parser.n_img
+        self.color_paths = parser.color_paths
+
+    def __getitem__(self, idx):
+        color_path = self.color_paths[idx]
+
+        image = np.array(Image.open(color_path))
+        depth = None
+
+        if self.disorted:
+            image = cv2.remap(image, self.map1x, self.map1y, cv2.INTER_LINEAR)
+
+        if self.has_depth:
+            depth_path = self.depth_paths[idx]
+            depth = np.array(Image.open(depth_path)) / self.depth_scale
+
+        image = (
+            torch.from_numpy(image / 255.0)
+            .clamp(0.0, 1.0)
+            .permute(2, 0, 1)
+            .to(device=self.device, dtype=self.dtype)
+        )
+        pose = torch.eye(4, device=self.device, dtype=self.dtype)
+        return image, depth, pose
 
 class ReplicaDataset(MonocularDataset):
     def __init__(self, args, path, config):
@@ -496,5 +548,7 @@ def load_dataset(args, path, config):
         return EurocDataset(args, path, config)
     elif config["Dataset"]["type"] == "realsense":
         return RealsenseDataset(args, path, config)
+    elif config["Dataset"]["type"] == "monocular":
+        return MonocularOnlyDataset(args, path, config)
     else:
         raise ValueError("Unknown dataset type")

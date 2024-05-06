@@ -1,5 +1,6 @@
 import random
 import time
+import wandb
 
 import torch
 import torch.multiprocessing as mp
@@ -14,7 +15,7 @@ from utils.slam_utils import get_loss_mapping
 
 
 class BackEnd(mp.Process):
-    def __init__(self, config):
+    def __init__(self, config, wandb_group_name=None):
         super().__init__()
         self.config = config
         self.gaussians = None
@@ -37,6 +38,21 @@ class BackEnd(mp.Process):
         self.current_window = []
         self.initialized = not self.monocular
         self.keyframe_optimizers = None
+        self.wandb_group_name = wandb_group_name
+    
+    def _init_wandb(self):
+        if self.wandb_group_name is not None:
+            wandb.init(
+                project="MonoGS",
+                name = f"{self.wandb_group_name}_BackEnd",
+                config=self.config,
+                mode=None if self.config["Results"]["use_wandb"] else "disabled",
+                group=self.wandb_group_name,
+            )
+            wandb.define_metric("loss/mapping_rgb", step_metric="frame_idx")
+            wandb.define_metric("loss/mapping_isotropic", step_metric="frame_idx")
+            wandb.define_metric("loss/mapping_init", step_metric="mapping_iteration")
+        
 
     def set_hyperparams(self):
         self.save_results = self.config["Results"]["save_results"]
@@ -110,6 +126,7 @@ class BackEnd(mp.Process):
                 self.config, image, depth, viewpoint, opacity, initialization=True
             )
             loss_init.backward()
+            wandb.log({"mapping_iteration": mapping_iteration, "loss/mapping_init": loss_init.mean().item()})
 
             with torch.no_grad():
                 self.gaussians.max_radii2D[visibility_filter] = torch.max(
@@ -126,7 +143,8 @@ class BackEnd(mp.Process):
                         self.init_gaussian_extent,
                         None,
                     )
-
+                
+                # Question: Why reset_opacity in the middle of initialization?
                 if self.iteration_count == self.init_gaussian_reset or (
                     self.iteration_count == self.opt_params.densify_from_iter
                 ):
@@ -136,12 +154,13 @@ class BackEnd(mp.Process):
                 self.gaussians.optimizer.zero_grad(set_to_none=True)
 
         self.occ_aware_visibility[cur_frame_idx] = (n_touched > 0).long()
-        Log("Initialized map")
+        Log("Initialized map", tag="Backend")
         return render_pkg
 
     def map(self, current_window, prune=False, iters=1):
         if len(current_window) == 0:
             return
+        Log(f"Mapping with keyframes {current_window}", tag="Backend")
 
         viewpoint_stack = [self.viewpoints[kf_idx] for kf_idx in current_window]
         random_viewpoint_stack = []
@@ -228,6 +247,8 @@ class BackEnd(mp.Process):
 
             scaling = self.gaussians.get_scaling
             isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))
+            wandb.log({"frame_idx": current_window[0], "loss/mapping_rgb": loss_mapping.mean().item()})
+            wandb.log({"frame_idx": current_window[0], "loss/mapping_isotropic": isotropic_loss.mean().item()})
             loss_mapping += 10 * isotropic_loss.mean()
             loss_mapping.backward()
             gaussian_split = False
@@ -270,7 +291,7 @@ class BackEnd(mp.Process):
                                 )
                         if not self.initialized:
                             self.initialized = True
-                            Log("Initialized SLAM")
+                            Log("Initialized SLAM", tag="BACKEND")
                         # # make sure we don't split the gaussians, break here.
                     return False
 
@@ -365,6 +386,7 @@ class BackEnd(mp.Process):
         self.frontend_queue.put(msg)
 
     def run(self):
+        self._init_wandb()
         while True:
             if self.backend_queue.empty():
                 if self.pause:
@@ -411,6 +433,7 @@ class BackEnd(mp.Process):
                     viewpoint = data[2]
                     current_window = data[3]
                     depth_map = data[4]
+                    Log(f"Received keyframe {cur_frame_idx}", tag="Backend")
 
                     self.viewpoints[cur_frame_idx] = viewpoint
                     self.current_window = current_window
@@ -473,6 +496,7 @@ class BackEnd(mp.Process):
                     self.map(self.current_window, iters=iter_per_kf)
                     self.map(self.current_window, prune=True)
                     self.push_to_frontend("keyframe")
+                    Log(f"Finished map with new keyframe {cur_frame_idx}", tag="Backend")
                 else:
                     raise Exception("Unprocessed data", data)
         while not self.backend_queue.empty():

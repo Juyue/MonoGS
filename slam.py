@@ -23,7 +23,7 @@ from utils.slam_frontend import FrontEnd
 
 
 class SLAM:
-    def __init__(self, config, save_dir=None):
+    def __init__(self, config, save_dir=None, wandb_group_name=None):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
 
@@ -70,7 +70,7 @@ class SLAM:
         self.config["Training"]["monocular"] = self.monocular
 
         self.frontend = FrontEnd(self.config)
-        self.backend = BackEnd(self.config)
+        self.backend = BackEnd(self.config, wandb_group_name=wandb_group_name)
 
         self.frontend.dataset = self.dataset
         self.frontend.background = self.background
@@ -199,6 +199,12 @@ class SLAM:
 
 
 if __name__ == "__main__":
+    import debugpy
+    port = 5700
+    debugpy.listen(address=("localhost", port))
+    print(f"Now is a good time to attach your debugger: Run: Python: Attach {port}")
+    debugpy.wait_for_client()
+
     # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")
     parser.add_argument("--config", type=str)
@@ -235,6 +241,10 @@ if __name__ == "__main__":
         )
         tmp = args.config
         tmp = tmp.split(".")[0]
+        if config["Results"]["use_wandb"]:
+            wandb_group_name = f"{tmp}_{current_datetime}"
+        else:
+            wandb_group_name = None
         config["Results"]["save_dir"] = save_dir
         mkdir_p(save_dir)
         with open(os.path.join(save_dir, "config.yml"), "w") as file:
@@ -242,14 +252,18 @@ if __name__ == "__main__":
         Log("saving results in " + save_dir)
         run = wandb.init(
             project="MonoGS",
-            name=f"{tmp}_{current_datetime}",
+            name = f"{wandb_group_name}_FrontEnd",
             config=config,
             mode=None if config["Results"]["use_wandb"] else "disabled",
+            group=wandb_group_name,
         )
         wandb.define_metric("frame_idx")
         wandb.define_metric("ate*", step_metric="frame_idx")
+        wandb.define_metric("loss/camera_pose_init", step_metric="frame_idx")
+        wandb.define_metric("loss/camera_pose_final", step_metric="frame_idx")
+        wandb.define_metric("loss/camera_pose_n_converge", step_metric="frame_idx")
 
-    slam = SLAM(config, save_dir=save_dir)
+    slam = SLAM(config, save_dir=save_dir, wandb_group_name=wandb_group_name)
 
     slam.run()
     wandb.finish()

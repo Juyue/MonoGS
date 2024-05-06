@@ -2,6 +2,7 @@ import pathlib
 import threading
 import time
 from datetime import datetime
+import os
 
 import cv2
 import glfw
@@ -73,6 +74,7 @@ class SLAM_GUI:
         self.save_path = "."
         self.save_path = pathlib.Path(self.save_path)
         self.save_path.mkdir(parents=True, exist_ok=True)
+        self.save_flag = True
 
         threading.Thread(target=self._update_thread).start()
 
@@ -182,9 +184,9 @@ class SLAM_GUI:
         self.time_shader_chbox.checked = False
         chbox_tile_geometry.add_child(self.time_shader_chbox)
 
-        self.elipsoid_chbox = gui.Checkbox("Elipsoid Shader")
-        self.elipsoid_chbox.checked = False
-        chbox_tile_geometry.add_child(self.elipsoid_chbox)
+        self.ellipsoid_chbox = gui.Checkbox("ellipsoid Shader")
+        self.ellipsoid_chbox.checked = False
+        chbox_tile_geometry.add_child(self.ellipsoid_chbox)
 
         self.panel.add_child(chbox_tile_geometry)
 
@@ -569,83 +571,95 @@ class SLAM_GUI:
                 self.scaling_slider.double_value,
             )
         return rendering_data
+    
+    def render_ellipsoid(self, current_cam):
+        if self.gaussian_cur is None:
+            return
+
+        glfw.poll_events()
+        gl.glClearColor(0, 0, 0, 1.0)
+        gl.glClear(
+            gl.GL_COLOR_BUFFER_BIT
+            | gl.GL_DEPTH_BUFFER_BIT
+            | gl.GL_STENCIL_BUFFER_BIT
+        )
+
+        w = int(self.window.size.width * self.widget3d_width_ratio)
+        glfw.set_window_size(self.window_gl, w, self.window.size.height)
+        self.g_camera.fovy = current_cam.FoVy
+        self.g_camera.update_resolution(self.window.size.height, w)
+        self.g_renderer.set_render_reso(w, self.window.size.height)
+        frustum = create_frustum(
+            np.linalg.inv(cv_gl @ self.widget3d.scene.camera.get_view_matrix())
+        )
+
+        self.g_camera.position = frustum.eye.astype(np.float32)
+        self.g_camera.target = frustum.center.astype(np.float32)
+        self.g_camera.up = frustum.up.astype(np.float32)
+
+        self.gaussians_gl.xyz = self.gaussian_cur.get_xyz.cpu().numpy()
+        self.gaussians_gl.opacity = self.gaussian_cur.get_opacity.cpu().numpy()
+        self.gaussians_gl.scale = self.gaussian_cur.get_scaling.cpu().numpy()
+        self.gaussians_gl.rot = self.gaussian_cur.get_rotation.cpu().numpy()
+        self.gaussians_gl.sh = self.gaussian_cur.get_features.cpu().numpy()[:, 0, :]
+
+        self.update_activated_renderer_state(self.gaussians_gl)
+        self.g_renderer.sort_and_update(self.g_camera)
+        width, height = glfw.get_framebuffer_size(self.window_gl)
+        self.g_renderer.draw()
+        bufferdata = gl.glReadPixels(
+            0, 0, width, height, gl.GL_RGB, gl.GL_UNSIGNED_BYTE
+        )
+        img = np.frombuffer(bufferdata, np.uint8, -1).reshape(height, width, 3)
+        cv2.flip(img, 0, img)
+        render_img = o3d.geometry.Image(img)
+        glfw.swap_buffers(self.window_gl)
+        return render_img
+    
+    def render_opacity(self, results):
+        opacity = results["opacity"]
+        opacity = opacity[0, :, :].detach().cpu().numpy()
+        max_opacity = np.max(opacity)
+        opacity = imgviz.depth2rgb(
+            opacity, min_value=0.0, max_value=max_opacity, colormap="jet"
+        )
+        opacity = torch.from_numpy(opacity)
+        opacity = torch.permute(opacity, (2, 0, 1)).float()
+        opacity = (opacity).byte().permute(1, 2, 0).contiguous().cpu().numpy()
+        return o3d.geometry.Image(opacity)
+    
+    def render_depth(self, results):
+        depth = results["depth"]
+        depth = depth[0, :, :].detach().cpu().numpy()
+        max_depth = np.max(depth)
+        depth = imgviz.depth2rgb(
+            depth, min_value=0.1, max_value=max_depth, colormap="jet"
+        )
+        depth = torch.from_numpy(depth)
+        depth = torch.permute(depth, (2, 0, 1)).float()
+        depth = (depth).byte().permute(1, 2, 0).contiguous().cpu().numpy()
+        return o3d.geometry.Image(depth)
+
+    def render_rgb(self, results):
+        rgb = (
+            (torch.clamp(results["render"], min=0, max=1.0) * 255)
+            .byte()
+            .permute(1, 2, 0)
+            .contiguous()
+            .cpu()
+            .numpy()
+        )
+        return o3d.geometry.Image(rgb)
 
     def render_o3d_image(self, results, current_cam):
         if self.depth_chbox.checked:
-            depth = results["depth"]
-            depth = depth[0, :, :].detach().cpu().numpy()
-            max_depth = np.max(depth)
-            depth = imgviz.depth2rgb(
-                depth, min_value=0.1, max_value=max_depth, colormap="jet"
-            )
-            depth = torch.from_numpy(depth)
-            depth = torch.permute(depth, (2, 0, 1)).float()
-            depth = (depth).byte().permute(1, 2, 0).contiguous().cpu().numpy()
-            render_img = o3d.geometry.Image(depth)
-
+            render_img = self.render_depth(results)
         elif self.opacity_chbox.checked:
-            opacity = results["opacity"]
-            opacity = opacity[0, :, :].detach().cpu().numpy()
-            max_opacity = np.max(opacity)
-            opacity = imgviz.depth2rgb(
-                opacity, min_value=0.0, max_value=max_opacity, colormap="jet"
-            )
-            opacity = torch.from_numpy(opacity)
-            opacity = torch.permute(opacity, (2, 0, 1)).float()
-            opacity = (opacity).byte().permute(1, 2, 0).contiguous().cpu().numpy()
-            render_img = o3d.geometry.Image(opacity)
-
-        elif self.elipsoid_chbox.checked:
-            if self.gaussian_cur is None:
-                return
-            glfw.poll_events()
-            gl.glClearColor(0, 0, 0, 1.0)
-            gl.glClear(
-                gl.GL_COLOR_BUFFER_BIT
-                | gl.GL_DEPTH_BUFFER_BIT
-                | gl.GL_STENCIL_BUFFER_BIT
-            )
-
-            w = int(self.window.size.width * self.widget3d_width_ratio)
-            glfw.set_window_size(self.window_gl, w, self.window.size.height)
-            self.g_camera.fovy = current_cam.FoVy
-            self.g_camera.update_resolution(self.window.size.height, w)
-            self.g_renderer.set_render_reso(w, self.window.size.height)
-            frustum = create_frustum(
-                np.linalg.inv(cv_gl @ self.widget3d.scene.camera.get_view_matrix())
-            )
-
-            self.g_camera.position = frustum.eye.astype(np.float32)
-            self.g_camera.target = frustum.center.astype(np.float32)
-            self.g_camera.up = frustum.up.astype(np.float32)
-
-            self.gaussians_gl.xyz = self.gaussian_cur.get_xyz.cpu().numpy()
-            self.gaussians_gl.opacity = self.gaussian_cur.get_opacity.cpu().numpy()
-            self.gaussians_gl.scale = self.gaussian_cur.get_scaling.cpu().numpy()
-            self.gaussians_gl.rot = self.gaussian_cur.get_rotation.cpu().numpy()
-            self.gaussians_gl.sh = self.gaussian_cur.get_features.cpu().numpy()[:, 0, :]
-
-            self.update_activated_renderer_state(self.gaussians_gl)
-            self.g_renderer.sort_and_update(self.g_camera)
-            width, height = glfw.get_framebuffer_size(self.window_gl)
-            self.g_renderer.draw()
-            bufferdata = gl.glReadPixels(
-                0, 0, width, height, gl.GL_RGB, gl.GL_UNSIGNED_BYTE
-            )
-            img = np.frombuffer(bufferdata, np.uint8, -1).reshape(height, width, 3)
-            cv2.flip(img, 0, img)
-            render_img = o3d.geometry.Image(img)
-            glfw.swap_buffers(self.window_gl)
+            render_img = self.render_opacity(results)
+        elif self.ellipsoid_chbox.checked:
+            render_img = self.render_ellipsoid(current_cam)
         else:
-            rgb = (
-                (torch.clamp(results["render"], min=0, max=1.0) * 255)
-                .byte()
-                .permute(1, 2, 0)
-                .contiguous()
-                .cpu()
-                .numpy()
-            )
-            render_img = o3d.geometry.Image(rgb)
+            render_img = self.render_rgb(results)
         return render_img
 
     def render_gui(self):
@@ -657,6 +671,38 @@ class SLAM_GUI:
             return
         self.render_img = self.render_o3d_image(results, current_cam)
         self.widget3d.scene.set_background([0, 0, 0, 1], self.render_img)
+
+        if self.save_flag:
+            # Save rendered images to disk
+            height = self.window.size.height
+            width = self.widget3d_width
+            app = o3d.visualization.gui.Application.instance
+            # compared to self.render_rgb, gui_image has vis for camera frames
+            gui_image = np.asarray(app.render_to_image(self.widget3d.scene, width, height))
+            gui_image = cv2.cvtColor(gui_image, cv2.COLOR_BGR2RGB)
+
+            # opacity_image = np.asarray(self.render_opacity(results))
+            # opacity_image = cv2.cvtColor(opacity_image, cv2.COLOR_BGR2RGB)
+
+            ellipsoid_image = np.asarray(self.render_ellipsoid(current_cam))
+            ellipsoid_image = cv2.cvtColor(ellipsoid_image, cv2.COLOR_BGR2RGB)
+
+            save_dir = os.path.join(self.save_path, "recording")
+            os.makedirs(save_dir, exist_ok=True)
+            if self.gaussian_cur.keyframes is not None:
+                curr_frame_idx = self.gaussian_cur.keyframes[0].uid
+            elif self.gaussian_cur.current_frame is not None:
+                curr_frame_idx = self.gaussian_cur.current_frame.uid
+            else:
+                curr_frame_idx = 100000
+            Log(f"Saving images for frame {curr_frame_idx} at step {self.step}", tag="SLAM_GUI")
+            gui_filename = os.path.join(save_dir, f"gui_{curr_frame_idx:06d}_{self.step:09d}")
+            # opacity_filename = os.path.join(save_dir, f"opacity_{curr_frame_idx:06d}")
+            ellipsoid_filename = os.path.join(save_dir, f"ellipsoid_{curr_frame_idx:06d}")
+
+            cv2.imwrite(f"{gui_filename}.png", gui_image)
+            # cv2.imwrite(f"{opacity_filename}.png", opacity_image)
+            cv2.imwrite(f"{ellipsoid_filename}.png", ellipsoid_image)
 
     def scene_update(self):
         self.receive_data(self.q_main2vis)

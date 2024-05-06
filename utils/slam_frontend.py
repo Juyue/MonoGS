@@ -1,4 +1,5 @@
 import time
+import wandb
 
 import numpy as np
 import torch
@@ -42,6 +43,11 @@ class FrontEnd(mp.Process):
         self.cameras = dict()
         self.device = "cuda:0"
         self.pause = False
+
+        if "skip_ate" in config["Results"]:
+            self.skip_ate = config["Results"]["skip_ate"]
+        else:
+            self.skip_ate = False
 
     def set_hyperparams(self):
         self.save_dir = self.config["Results"]["save_dir"]
@@ -178,6 +184,8 @@ class FrontEnd(mp.Process):
             with torch.no_grad():
                 pose_optimizer.step()
                 converged = update_pose(viewpoint)
+            if tracking_itr == 0:
+                wandb.log({"loss/camera_pose_init": loss_tracking.item(), "frame_idx": cur_frame_idx})
 
             if tracking_itr % 10 == 0:
                 self.q_main2vis.put(
@@ -190,6 +198,8 @@ class FrontEnd(mp.Process):
                     )
                 )
             if converged:
+                wandb.log({"loss/camera_pose_final": loss_tracking.item(), "frame_idx": cur_frame_idx})
+                wandb.log({"loss/camera_pose_n_converge": tracking_itr, "frame_idx": cur_frame_idx})
                 break
 
         self.median_depth = get_median_depth(depth, opacity)
@@ -222,6 +232,8 @@ class FrontEnd(mp.Process):
             cur_frame_visibility_filter, occ_aware_visibility[last_keyframe_idx]
         ).count_nonzero()
         point_ratio_2 = intersection / union
+        wandb.log({"keyframe/point_iou": point_ratio_2})
+        wandb.log({"keyframe/dist": dist})
         return (point_ratio_2 < kf_overlap and dist_check2) or dist_check
 
     def add_to_window(
@@ -286,15 +298,18 @@ class FrontEnd(mp.Process):
         return window, removed_frame
 
     def request_keyframe(self, cur_frame_idx, viewpoint, current_window, depthmap):
+        Log(f"Requesting Keyframe: {cur_frame_idx}", tag="Frontend")
         msg = ["keyframe", cur_frame_idx, viewpoint, current_window, depthmap]
         self.backend_queue.put(msg)
         self.requested_keyframe += 1
 
     def reqeust_mapping(self, cur_frame_idx, viewpoint):
+        Log(f"Requesting Mapping: {cur_frame_idx}", tag="Frontend")
         msg = ["map", cur_frame_idx, viewpoint]
         self.backend_queue.put(msg)
 
     def request_init(self, cur_frame_idx, viewpoint, depth_map):
+        Log(f"Requesting init: {cur_frame_idx}", tag="Frontend")
         msg = ["init", cur_frame_idx, viewpoint, depth_map]
         self.backend_queue.put(msg)
         self.requested_init = True
@@ -353,6 +368,7 @@ class FrontEnd(mp.Process):
                             0,
                             final=True,
                             monocular=self.monocular,
+                            skip_ate=self.skip_ate,
                         )
                         save_gaussians(
                             self.gaussians, self.save_dir, "final", final=True
@@ -390,11 +406,12 @@ class FrontEnd(mp.Process):
 
                 # Tracking
                 render_pkg = self.tracking(cur_frame_idx, viewpoint)
-
+                
+                # What is this current_window thing?
                 current_window_dict = {}
                 current_window_dict[self.current_window[0]] = self.current_window[1:]
                 keyframes = [self.cameras[kf_idx] for kf_idx in self.current_window]
-
+                
                 self.q_main2vis.put(
                     gui_utils.GaussianPacket(
                         gaussians=clone_obj(self.gaussians),
@@ -471,19 +488,26 @@ class FrontEnd(mp.Process):
                         self.save_dir,
                         cur_frame_idx,
                         monocular=self.monocular,
+                        skip_ate=self.skip_ate,
                     )
                 toc.record()
                 torch.cuda.synchronize()
                 if create_kf:
                     # throttle at 3fps when keyframe is added
-                    duration = tic.elapsed_time(toc)
-                    time.sleep(max(0.01, 1.0 / 3.0 - duration / 1000))
+                    # duration = tic.elapsed_time(toc)
+                    # time.sleep(max(0.01, 1.0 / 3.0 - duration / 1000))
+                    # I want to wait for backend to send back the updated gaussian map
+
+                    # ?waiting for backend to send back the updated gaussian map
+                    while self.frontend_queue.empty():
+                        time.sleep(3.0)
             else:
                 data = self.frontend_queue.get()
                 if data[0] == "sync_backend":
                     self.sync_backend(data)
 
                 elif data[0] == "keyframe":
+                    Log(f"Received updated keyframe {cur_frame_idx}", tag="Frontend")
                     self.sync_backend(data)
                     self.requested_keyframe -= 1
 

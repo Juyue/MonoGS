@@ -375,6 +375,7 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
 
     def load_ply(self, path):
+        print(f"Loading PlyData from {path}")
         plydata = PlyData.read(path)
 
         def fetchPly_nocolor(path):
